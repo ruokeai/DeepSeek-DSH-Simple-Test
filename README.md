@@ -9,7 +9,7 @@ Simple test results of DeepSeek running in DSH minimal mode.
 | --- | --- | --- |
 | `极简` | 使用 DSH 的极简模式生成 | 效果最好 |
 | `极简+提示词` | 极简模式 + `agents.md` 提示词 | 内容最丰富 |
-| `ptc` | DSH 的正常模式（PTC） | 常规效果 |
+| `ptc` | DSH 的正常模式（PTC） | 常规效果 （一坨答辩，改了40分钟还没改完那种）|
 
 ## 文件说明 / Files
 
