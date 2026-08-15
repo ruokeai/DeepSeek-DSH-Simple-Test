@@ -1,0 +1,382 @@
+
+"use strict";
+/* ================================================================
+   GARGANTUA — Interstellar 黑洞致敬
+   史瓦西度规光子测地线光线追踪（GPU 逐像素 RK4）
+   ================================================================ */
+
+/* ---------- 画布与上下文 ---------- */
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl2", { antialias:false, depth:false, stencil:false,
+  powerPreference:"high-performance", preserveDrawingBuffer:false });
+
+const loader = document.getElementById("loader");
+const errBox = document.getElementById("errmsg");
+function fail(msg){
+  errBox.style.display = "block";
+  errBox.innerHTML = msg;
+  document.querySelector("#loader .spin").style.display = "none";
+  document.querySelector("#loader .txt").textContent = "";
+}
+if(!gl){ fail("你的浏览器不支持 WebGL2，无法运行本模拟。<br>请使用最新版 Chrome / Edge / Firefox。"); throw new Error("no webgl2"); }
+if(!gl.getExtension("EXT_color_buffer_float")){
+  fail("你的 GPU 不支持浮点渲染缓冲（EXT_color_buffer_float），无法运行 HDR 光线追踪。<br>请更新显卡驱动或更换浏览器。"); throw new Error("no float rt");
+}
+
+/* ---------- GL 工具 ---------- */
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    const log = gl.getShaderInfoLog(s);
+    gl.deleteShader(s);
+    throw new Error("shader compile: " + log);
+  }
+  return s;
+}
+function program(fsSrc){
+  const vs = compile(gl.VERTEX_SHADER, "#version 300 es
+" +
+    "void main(){
+" +
+    "  vec2 p = vec2( (gl_VertexID==0)?-1.0:3.0, (gl_VertexID==2)?3.0:-1.0 );
+" +
+    "  gl_Position = vec4(p, 0.0, 1.0);
+" +
+    "}");
+  const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
+    throw new Error("program link: " + gl.getProgramInfoLog(p));
+  }
+  return p;
+}
+function makeTex(w, h){
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function makeFB(tex){
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE)
+    throw new Error("framebuffer incomplete");
+  return fb;
+}
+function uniforms(p){
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  const map = {};
+  for(let i=0;i<n;i++){
+    const info = gl.getActiveUniform(p, i);
+    map[info.name] = gl.getUniformLocation(p, info.name);
+  }
+  return map;
+}
+function bindTex(unit, loc, tex){ gl.activeTexture(gl.TEXTURE0+unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); }
+
+/* ---------- GLSL 读取 ---------- */
+const TRACE_FS_SRC     = document.getElementById("fs-trace").textContent;
+const BRIGHT_FS_SRC    = document.getElementById("fs-bright").textContent;
+const BLUR_FS_SRC      = document.getElementById("fs-blur").textContent;
+const COMPOSITE_FS_SRC = document.getElementById("fs-composite").textContent;
+
+/* ---------- passes ---------- */
+let pTrace, pBright, pBlur, pComposite;
+let uTrace, uBright, uBlur, uComposite;
+function initPasses(){
+  pTrace     = program(TRACE_FS_SRC);
+  pBright    = program(BRIGHT_FS_SRC);
+  pBlur      = program(BLUR_FS_SRC);
+  pComposite = program(COMPOSITE_FS_SRC);
+  uTrace = uniforms(pTrace); uBright = uniforms(pBright);
+  uBlur = uniforms(pBlur);   uComposite = uniforms(pComposite);
+}
+
+/* ---------- 渲染目标 ---------- */
+let IW = 0, IH = 0;            // 内部渲染尺寸
+let sceneTex, accumTex, sceneFB, accumFB;
+let bloomTexA, bloomTexB, bloomFBA, bloomFBB;
+function initTargets(){
+  if(sceneTex){ gl.deleteTexture(sceneTex); gl.deleteTexture(accumTex); }
+  if(bloomTexA){ gl.deleteTexture(bloomTexA); gl.deleteTexture(bloomTexB); }
+  if(sceneFB){ gl.deleteFramebuffer(sceneFB); gl.deleteFramebuffer(accumFB); }
+  if(bloomFBA){ gl.deleteFramebuffer(bloomFBA); gl.deleteFramebuffer(bloomFBB); }
+  const bw = Math.max(2, IW>>2), bh = Math.max(2, IH>>2);
+  sceneTex = makeTex(IW,IH); accumTex = makeTex(IW,IH);
+  sceneFB = makeFB(sceneTex); accumFB = makeFB(accumTex);
+  bloomTexA = makeTex(bw,bh); bloomTexB = makeTex(bw,bh);
+  bloomFBA = makeFB(bloomTexA); bloomFBB = makeFB(bloomTexB);
+}
+
+/* ---------- 相机状态 ---------- */
+const cam = { theta: 0.34, phi: 0.55, r: 26.0 };   // 球坐标：theta 相对盘法向(y)，phi 方位角
+const camTarget = { theta: 0.34, phi: 0.55, r: 26.0 }; // 平滑目标
+const fovY = 55 * Math.PI/180;
+
+/* ---------- 设置状态 ---------- */
+const settings = {
+  quality: 0.75,          // 内部渲染 scale
+  doppler: 0.72,          // 多普勒强度（电影做了艺术化弱化）
+  autoCinema: true,       // 自动运镜
+  aaAccum: true,          // 时间累积抗锯齿
+};
+let autoBase = { t: performance.now()*0.001, phi: 0.55, theta: 0.34, r: 26.0 };
+let accFrames = 0;
+let frameCount = 0;
+let lastT = performance.now();
+
+/* ---------- 输入 ---------- */
+let dragging = false, lastPX = 0, lastPY = 0;
+let pinchDist = 0;
+const pointerPos = new Map();
+
+function clampCam(){
+  camTarget.theta = Math.min(1.2, Math.max(0.05, camTarget.theta));
+  camTarget.r     = Math.min(60,  Math.max(7.6,  camTarget.r));
+}
+function rotateBy(dx, dy){
+  camTarget.phi   -= dx * 0.0055;
+  camTarget.theta -= dy * 0.0042;
+  clampCam();
+}
+function zoomBy(f){
+  camTarget.r = Math.min(60, Math.max(7.6, camTarget.r * f));
+  bumpAccum();
+}
+
+canvas.addEventListener("pointerdown", e => {
+  canvas.setPointerCapture(e.pointerId);
+  pointerPos.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if(pointerPos.size === 1){ dragging = true; lastPX = e.clientX; lastPY = e.clientY; document.body.classList.add("dragging"); }
+  else if(pointerPos.size === 2){ dragging = false; document.body.classList.remove("dragging");
+    const pts = [...pointerPos.values()]; pinchDist = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y); }
+  if(settings.autoCinema){
+    settings.autoCinema = false; syncAutoUI();
+  }
+  bumpAccum();
+});
+canvas.addEventListener("pointermove", e => {
+  if(!pointerPos.has(e.pointerId)) return;
+  pointerPos.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if(pointerPos.size === 1 && dragging){
+    rotateBy(e.clientX - lastPX, e.clientY - lastPY);
+    lastPX = e.clientX; lastPY = e.clientY;
+    bumpAccum();
+  } else if(pointerPos.size === 2){
+    const pts = [...pointerPos.values()];
+    const d = Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
+    if(pinchDist > 0) zoomBy(pinchDist / d);
+    pinchDist = d;
+  }
+});
+function endPointer(e){
+  pointerPos.delete(e.pointerId);
+  if(pointerPos.size === 0){ dragging = false; document.body.classList.remove("dragging"); pinchDist = 0; }
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  zoomBy(Math.exp(e.deltaY * 0.0012));
+}, { passive:false });
+canvas.addEventListener("dblclick", () => {
+  settings.autoCinema = !settings.autoCinema;
+  if(settings.autoCinema){
+    autoBase = { t: performance.now()*0.001, phi: cam.phi, theta: cam.theta, r: cam.r };
+  }
+  syncAutoUI(); bumpAccum();
+});
+
+/* ---------- UI 绑定 ---------- */
+const btnAuto = document.getElementById("btnAuto");
+const btnAA   = document.getElementById("btnAA");
+const segQ    = document.getElementById("segQ");
+const doppler = document.getElementById("doppler");
+const hint    = document.getElementById("hint");
+
+function syncAutoUI(){ btnAuto.classList.toggle("on", settings.autoCinema); }
+function syncAAUI(){ btnAA.classList.toggle("on", settings.aaAccum); }
+btnAuto.addEventListener("click", () => {
+  settings.autoCinema = !settings.autoCinema;
+  if(settings.autoCinema)
+    autoBase = { t: performance.now()*0.001, phi: cam.phi, theta: cam.theta, r: cam.r };
+  syncAutoUI(); bumpAccum();
+});
+btnAA.addEventListener("click", () => {
+  settings.aaAccum = !settings.aaAccum; syncAAUI(); bumpAccum();
+});
+segQ.addEventListener("click", e => {
+  const b = e.target.closest("button"); if(!b) return;
+  settings.quality = parseFloat(b.dataset.q);
+  [...segQ.children].forEach(x => x.classList.toggle("on", x === b));
+  resize();
+});
+doppler.addEventListener("input", () => { settings.doppler = parseFloat(doppler.value); });
+
+/* ---------- 累积控制 ---------- */
+function bumpAccum(){
+  accFrames = 0;
+  hint.classList.remove("hidden");
+  clearTimeout(hint._t);
+  hint._t = setTimeout(() => hint.classList.add("hidden"), 4000);
+}
+
+/* ---------- resize ---------- */
+let cssW = 1, cssH = 1;
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cssW = Math.max(1, Math.floor(canvas.clientWidth));
+  cssH = Math.max(1, Math.floor(canvas.clientHeight));
+  IW = Math.max(2, Math.floor(cssW * dpr * settings.quality));
+  IH = Math.max(2, Math.floor(cssH * dpr * settings.quality));
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  initTargets();
+  bumpAccum();
+}
+window.addEventListener("resize", resize);
+
+/* ---------- Halton ---------- */
+function halton(i, base){
+  let f = 1, r = 0;
+  while(i > 0){ f /= base; r += f * (i % base); i = Math.floor(i / base); }
+  return r;
+}
+
+/* ---------- 相机基 ---------- */
+const camPos = [0,0,0], camRight = [0,0,0], camUp = [0,0,0], camFwd = [0,0,0];
+function updateCamera(dt){
+  if(settings.autoCinema){
+    const t = performance.now()*0.001 - autoBase.t;
+    camTarget.phi   = autoBase.phi   + t * 0.042;
+    camTarget.theta = autoBase.theta + 0.028 * Math.sin(t * 0.11);
+    camTarget.r     = autoBase.r     + 1.7 * Math.sin(t * 0.063);
+  }
+  const k = 1 - Math.exp(-dt * 6.5);
+  cam.theta += (camTarget.theta - cam.theta) * k;
+  cam.phi   += (camTarget.phi   - cam.phi  ) * k;
+  cam.r     += (camTarget.r     - cam.r    ) * k;
+  if(settings.autoCinema) accFrames = 0;
+
+  const st = Math.sin(cam.theta), ct = Math.cos(cam.theta);
+  const sp = Math.sin(cam.phi),   cp = Math.cos(cam.phi);
+  camPos[0] = cam.r * st * cp;
+  camPos[1] = cam.r * ct;
+  camPos[2] = cam.r * st * sp;
+  camFwd[0] = -camPos[0]; camFwd[1] = -camPos[1]; camFwd[2] = -camPos[2];
+  const fl = Math.hypot(camFwd[0], camFwd[1], camFwd[2]);
+  camFwd[0]/=fl; camFwd[1]/=fl; camFwd[2]/=fl;
+  // right = normalize(cross(fwd, worldUp=(0,1,0)))
+  let rx = -camFwd[2], ry = 0, rz = camFwd[0];
+  const rl = Math.hypot(rx, rz) || 1;
+  rx/=rl; rz/=rl;
+  camRight[0]=rx; camRight[1]=ry; camRight[2]=rz;
+  // up = cross(right, fwd)
+  camUp[0] = camRight[1]*camFwd[2]-camRight[2]*camFwd[1];
+  camUp[1] = camRight[2]*camFwd[0]-camRight[0]*camFwd[2];
+  camUp[2] = camRight[0]*camFwd[1]-camRight[1]*camFwd[0];
+}
+
+/* ---------- 渲染 ---------- */
+function setViewport(w,h){ gl.viewport(0,0,w,h); }
+
+function render(){
+  frameCount++;
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - lastT)/1000);
+  lastT = now;
+  updateCamera(dt);
+
+  // 累积系数：静止且开启时渐进混合
+  const accumulating = settings.aaAccum && !dragging
+    && Math.abs(cam.r-camTarget.r)<0.01
+    && Math.abs(cam.theta-camTarget.theta)<0.002
+    && Math.abs(cam.phi-camTarget.phi)<0.002
+    && !settings.autoCinema;
+  if(!accumulating) accFrames = 0; else accFrames = Math.min(accFrames+1, 72);
+  const blend = accumulating ? 1/(accFrames+1) : 1;
+
+  const aspect = IW / IH;
+  const tanHalf = Math.tan(fovY*0.5);
+  const jitterX = accumulating ? (halton(accFrames,2)-0.5)/IW : 0;
+  const jitterY = accumulating ? (halton(accFrames,3)-0.5)/IH : 0;
+
+  /* ---- 1. 场景光线追踪 ---- */
+  gl.disable(gl.BLEND);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, accumFB);
+  setViewport(IW,IH);
+  gl.useProgram(pTrace);
+  gl.uniform2f(uTrace.uResolution, IW, IH);
+  gl.uniform3fv(uTrace.uCamPos, camPos);
+  gl.uniform3fv(uTrace.uCamRight, camRight);
+  gl.uniform3fv(uTrace.uCamUp, camUp);
+  gl.uniform3fv(uTrace.uCamFwd, camFwd);
+  gl.uniform1f(uTrace.uTanHalfFov, tanHalf);
+  gl.uniform1f(uTrace.uAspect, aspect);
+  gl.uniform1f(uTrace.uTime, now*0.001);
+  gl.uniform1f(uTrace.uDoppler, settings.doppler);
+  gl.uniform2f(uTrace.uJitter, jitterX, jitterY);
+  gl.uniform1f(uTrace.uBlend, blend);
+  bindTex(0, uTrace.uPrev, sceneTex);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  { const t = sceneTex; sceneTex = accumTex; accumTex = t;
+    const f = sceneFB; sceneFB = accumFB; accumFB = f; }
+
+  /* ---- 2. bloom：亮部提取 ---- */
+  const bw = Math.max(2, IW>>2), bh = Math.max(2, IH>>2);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBA);
+  setViewport(bw,bh);
+  gl.useProgram(pBright);
+  bindTex(0, uBright.uScene, sceneTex);
+  gl.uniform2f(uBright.uRes, bw, bh);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  /* ---- 3. bloom：高斯模糊（H+V） ---- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBB);
+  gl.useProgram(pBlur);
+  bindTex(0, uBlur.uTex, bloomTexA);
+  gl.uniform2f(uBlur.uDir, 1, 0);
+  gl.uniform2f(uBlur.uRes, bw, bh);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBA);
+  bindTex(0, uBlur.uTex, bloomTexB);
+  gl.uniform2f(uBlur.uDir, 0, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  /* ---- 4. 合成到屏幕 ---- */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  setViewport(canvas.width, canvas.height);
+  gl.useProgram(pComposite);
+  bindTex(0, uComposite.uScene, sceneTex);
+  bindTex(1, uComposite.uBloom, bloomTexA);
+  gl.uniform2f(uComposite.uRes, canvas.width, canvas.height);
+  gl.uniform2f(uComposite.uSceneRes, IW, IH);
+  gl.uniform1f(uComposite.uTime, now*0.001);
+  gl.uniform1f(uComposite.uFrame, frameCount);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function loop(){
+  render();
+  requestAnimationFrame(loop);
+}
+
+/* ---------- 启动 ---------- */
+try{
+  initPasses();
+  resize();
+  loop();
+  setTimeout(() => loader.classList.add("gone"), 900);
+}catch(err){
+  console.error(err);
+  fail("着色器初始化失败：<br>" + String(err.message).slice(0, 300).replace(/</g,"&lt;"));
+}

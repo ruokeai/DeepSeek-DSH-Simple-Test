@@ -1,0 +1,54 @@
+
+#version 300 es
+precision highp float;
+uniform sampler2D uScene;
+uniform sampler2D uBloom;
+uniform vec2 uRes;        // canvas 输出分辨率
+uniform vec2 uSceneRes;   // 内部渲染分辨率
+uniform float uTime;
+uniform float uFrame;
+out vec4 fragColor;
+
+vec3 aces(vec3 x){
+  return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0);
+}
+float hash12(vec2 p){
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec2 c = uv - 0.5;
+  float r2 = dot(c, c);
+
+  // 轻微径向色差（电影镜头感）
+  vec2 off = c * (1.0 + 3.0*r2) * 1.6 / uSceneRes;
+  vec3 col;
+  col.r = texture(uScene, uv + off).r;
+  col.g = texture(uScene, uv).g;
+  col.b = texture(uScene, uv - off).b;
+
+  // bloom 柔光
+  vec3 bloom = texture(uBloom, uv).rgb;
+  col += bloom * 0.9;
+
+  // 曝光
+  col *= 1.25;
+
+  // ACES 色调映射
+  col = aces(col);
+
+  // 胶片颗粒
+  float g = hash12(uv * uRes + vec2(uFrame*1.37, uFrame*0.71));
+  col += (g - 0.5) * 0.028;
+
+  // 暗角
+  float vig = smoothstep(0.85, 0.25, length(c) * 1.08);
+  col *= mix(0.55, 1.0, vig);
+
+  col = clamp(col, 0.0, 1.0);
+  col = pow(col, vec3(1.0/2.2));
+  fragColor = vec4(col, 1.0);
+}

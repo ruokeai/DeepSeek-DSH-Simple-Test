@@ -1,0 +1,13 @@
+
+#version 300 es
+precision highp float;
+uniform sampler2D uScene;
+uniform vec2 uRes;
+out vec4 fragColor;
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec3 c = texture(uScene, uv).rgb;
+  float l = max(c.r, max(c.g, c.b));
+  float w = smoothstep(0.85, 2.4, l);      // 亮部软阈值
+  fragColor = vec4(c * w, 1.0);
+}

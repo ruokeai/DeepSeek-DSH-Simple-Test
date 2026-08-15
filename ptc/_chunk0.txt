@@ -1,0 +1,264 @@
+
+#version 300 es
+precision highp float;
+
+uniform vec2  uResolution;
+uniform vec3  uCamPos;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform vec3  uCamFwd;
+uniform float uTanHalfFov;
+uniform float uAspect;
+uniform float uTime;
+uniform float uDoppler;   // 多普勒强度（电影做了艺术化弱化，0=关闭 1=物理完整）
+uniform vec2  uJitter;
+uniform float uBlend;
+uniform sampler2D uPrev;
+
+out vec4 fragColor;
+
+/* ---------- 常量（G = c = M = 1，史瓦西半径 = 2） ---------- */
+#define DISK_IN   6.0     // ISCO
+#define DISK_OUT  42.0
+#define DISK_H    0.42    // 盘半厚度
+#define R_ESCAPE  46.0
+#define MAX_STEPS 800
+#define DPHI      0.05
+
+/* ---------- hash / 噪声 ---------- */
+float hash12(vec2 p){
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+float hash13(vec3 p){
+  p = fract(p * 0.1031);
+  p += dot(p, p.zyx + 31.32);
+  return fract((p.x + p.y) * p.z);
+}
+vec3 hash31(vec3 p){
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f*f*(3.0-2.0*f);
+  float a = hash12(i);
+  float b = hash12(i+vec2(1.0,0.0));
+  float c = hash12(i+vec2(0.0,1.0));
+  float d = hash12(i+vec2(1.0,1.0));
+  return mix(mix(a,b,u.x), mix(c,d,u.x), u.y);
+}
+float fbm(vec2 p){
+  float v = 0.0, a = 0.5;
+  mat2 m = mat2(1.6, 1.2, -1.2, 1.6);
+  for(int i=0;i<4;i++){
+    v += a * vnoise(p);
+    p = m * p;
+    a *= 0.5;
+  }
+  return v;
+}
+
+/* ---------- 黑体颜色（Neil Bartlett 拟合，K → sRGB） ---------- */
+vec3 blackbody(float t){
+  t = clamp(t, 1000.0, 40000.0) / 100.0;
+  float r,g,b;
+  if(t <= 66.0){
+    r = 1.0;
+    g = 0.3900815787690196*log(t) - 0.6318414437886275;
+  } else {
+    r = 1.292936186062745*pow(t-60.0, -0.1332047592);
+    g = 1.129890860895294*pow(t-60.0, -0.0755148492);
+  }
+  if(t >= 66.0) b = 1.0;
+  else if(t <= 19.0) b = 0.0;
+  else b = 0.543206789110196*log(t-10.0) - 1.19625408914;
+  return clamp(vec3(r,g,b), 0.0, 1.0);
+}
+
+/* ---------- 背景星空与星云 ---------- */
+float starField(vec3 dir, float scale, float threshold, float sharpness){
+  vec3 p = dir * scale;
+  vec3 id = floor(p);
+  float s = 0.0;
+  for(int x=-1;x<=1;x++)
+  for(int y=-1;y<=1;y++)
+  for(int z=-1;z<=1;z++){
+    vec3 cell = id + vec3(float(x),float(y),float(z));
+    float h = hash13(cell);
+    if(h > threshold){
+      vec3 center = cell + 0.5 + (hash31(cell+7.7)-0.5)*0.6;
+      float d = length(p - center);
+      float mag = 0.4 + 1.6*hash13(cell+3.1);
+      s += exp(-d*d*sharpness) * mag;
+    }
+  }
+  return s;
+}
+vec3 background(vec3 dir){
+  // 弥漫星云（暖冷交织，暗弱）
+  vec2 q = vec2(dir.x + dir.y*0.35, dir.z - dir.y*0.22);
+  float neb = fbm(q*0.72 + vec2(0.4, 1.9)) * 0.55 + fbm(q*1.9 - vec2(2.1, 0.7)) * 0.3;
+  vec3 col = vec3(0.014, 0.013, 0.012);
+  col += vec3(0.085, 0.048, 0.023) * neb * neb * 2.6;
+  col += vec3(0.024, 0.032, 0.046) * fbm(dir.xy*1.1 + dir.yz*0.7) * 0.5;
+  // 星点（两层）
+  float stars  = starField(dir, 14.0, 0.9982, 900.0);
+  float stars2 = starField(dir, 55.0, 0.99965, 2600.0);
+  col += vec3(0.72, 0.70, 0.65) * stars * 1.3;
+  col += vec3(0.85, 0.83, 0.78) * stars2 * 1.7;
+  return col;
+}
+
+/* ---------- 吸积盘程序化纹理 ---------- */
+float diskTexture(float r, float phi, float time){
+  float Omega = pow(r, -1.5);
+  float shear = phi - Omega * time * 1.9;        // 共转坐标（开普勒剪切）
+  vec2 p = vec2(r*0.32, shear*3.2);
+  float n = 0.0;
+  n += fbm(p) * 0.62;
+  n += fbm(p*3.3 + vec2(11.7, 3.1)) * 0.27;
+  n += fbm(p*11.0 + vec2(5.3, 8.9)) * 0.11;
+  float fil = fbm(vec2(r*0.5, shear*14.0 + r*1.3));  // 细丝
+  float radial = pow(r/DISK_IN, -1.55);              // 径向衰减
+  float rim = 1.0 + 2.2*exp(-(r-DISK_IN)*0.75);      // 内缘灼热
+  return radial * (0.30 + 0.70*n) * (0.72 + 0.28*fil) * rim;
+}
+
+/* ---------- 追踪结果 ---------- */
+struct Hit {
+  float type;    // 0 捕获 / 1 盘 / 2 逃逸
+  float r;
+  float phiOrb;  // 轨道平面内方位角
+  vec3  e1, e2;  // 轨道平面基
+  vec3  bgDir;
+  float b;       // 碰撞参数（守恒量）
+};
+
+/* ---------- 测地线追踪 ----------
+   轨道平面由 e1=ro/|ro| 与光线切向 e2 张成；
+   积分光子轨道方程 d²u/dφ² = -u + 1.5u²（u = 1/r）。 */
+Hit trace(vec3 ro, vec3 rd){
+  Hit h;
+  h.type = 2.0; h.bgDir = rd; h.r = 0.0; h.phiOrb = 0.0; h.b = 0.0;
+  float r0 = length(ro);
+  vec3 e1 = ro / r0;
+  vec3 e2 = rd - dot(rd, e1)*e1;
+  float tang = length(e2);
+  if(tang < 1e-4){
+    // 径向特例：向内必捕获，向外必逃逸
+    h.type = (dot(rd, e1) > 0.0) ? 2.0 : 0.0;
+    return h;
+  }
+  e2 /= tang;
+  h.e1 = e1; h.e2 = e2;
+
+  float u = 1.0 / r0;
+  float dudp = -u * dot(rd, e1) / tang;
+  float b2 = u*u + dudp*dudp - 2.0*u*u*u;
+  if(b2 <= 0.0){ h.type = 0.0; return h; }
+  h.b = inversesqrt(b2);
+
+  float phi = 0.0;
+  bool haveDisk = false;
+  float diskR = 0.0, diskPhi = 0.0;
+
+  for(int i=0;i<MAX_STEPS;i++){
+    // RK4
+    float k1u = dudp;
+    float k1v = -u + 1.5*u*u;
+    float ua = u + 0.5*DPHI*k1u;
+    float k2u = dudp + 0.5*DPHI*k1v;
+    float k2v = -ua + 1.5*ua*ua;
+    float ub = u + 0.5*DPHI*k2u;
+    float k3u = dudp + 0.5*DPHI*k2v;
+    float k3v = -ub + 1.5*ub*ub;
+    float uc = u + DPHI*k3u;
+    float k4u = dudp + DPHI*k3v;
+    float k4v = -uc + 1.5*uc*uc;
+
+    float uNew    = u    + DPHI/6.0*(k1u + 2.0*k2u + 2.0*k3u + k4u);
+    float dudpNew = dudp + DPHI/6.0*(k1v + 2.0*k2v + 2.0*k3v + k4v);
+
+    // 落入视界
+    if(uNew > 0.495){ h.type = 0.0; return h; }
+
+    // 盘命中（最近交点；|y|<DISK_H 且 r ∈ [DISK_IN, DISK_OUT]）
+    if(!haveDisk){
+      float uMid = 0.5*(u + uNew);
+      float rMid = 1.0/uMid;
+      float phiMid = phi + 0.5*DPHI;
+      float y = rMid * (cos(phiMid)*e1.y + sin(phiMid)*e2.y);
+      if(abs(y) < DISK_H && rMid > DISK_IN && rMid < DISK_OUT){
+        haveDisk = true; diskR = rMid; diskPhi = phiMid;
+      }
+    }
+
+    // 逃逸到远处
+    if(uNew < 1.0/R_ESCAPE && dudpNew < 0.0){
+      float phiE = phi + DPHI;
+      float rE = 1.0/uNew;
+      float vtOverVr = -1.0/(rE*dudpNew);
+      vec3 erE = cos(phiE)*e1 + sin(phiE)*e2;
+      vec3 etE = -sin(phiE)*e1 + cos(phiE)*e2;
+      h.bgDir = normalize(erE + vtOverVr*etE);
+      if(haveDisk){ h.type = 1.0; h.r = diskR; h.phiOrb = diskPhi; }
+      else h.type = 2.0;
+      return h;
+    }
+
+    u = uNew; dudp = dudpNew; phi += DPHI;
+  }
+  // 步数耗尽：仍困在光子球附近视为捕获
+  if(u > 0.15){ h.type = 0.0; return h; }
+  h.type = 2.0; h.bgDir = rd;
+  return h;
+}
+
+/* ---------- 盘着色（相对论多普勒 + 黑体） ---------- */
+vec3 shadeDisk(Hit h, float time){
+  vec3 P = h.r * (cos(h.phiOrb)*h.e1 + sin(h.phiOrb)*h.e2);
+  float phiDisk = atan(P.z, P.x);
+
+  // 开普勒角速度与洛伦兹因子
+  float Omega = pow(h.r, -1.5);
+  float ut = inversesqrt(max(1.0 - 3.0/h.r, 0.04));
+  // 光子角动量在盘法向(y)上的投影：轨道平面法向 = e1 × e2
+  vec3 n = cross(h.e1, h.e2);
+  float by = h.b * n.y;
+  // 观测能量 / 发射能量
+  float g = 1.0 / (ut * (1.0 - by * Omega));
+  g = clamp(g, 0.12, 5.0);
+  float gMix = mix(1.0, g, uDoppler);
+
+  float T = 6900.0 * pow(h.r / DISK_IN, -0.75);
+  vec3 col = blackbody(T * gMix);
+  float tex = diskTexture(h.r, phiDisk, time);
+  float lum = pow(gMix, 3.0) * tex;
+  return col * lum;
+}
+
+/* ---------- 主函数 ---------- */
+void main(){
+  vec2 ndc = (gl_FragCoord.xy + 0.5) / uResolution * 2.0 - 1.0;
+  ndc += uJitter * 2.0;
+  ndc.x *= uAspect;
+  vec3 rd = normalize(uCamFwd + ndc.x*uTanHalfFov*uCamRight + ndc.y*uTanHalfFov*uCamUp);
+  vec3 ro = uCamPos;
+
+  Hit h = trace(ro, rd);
+  vec3 col;
+  if(h.type < 0.5){
+    col = vec3(0.0);                    // 事件视界：绝对黑
+  } else if(h.type < 1.5){
+    col = shadeDisk(h, uTime);
+  } else {
+    col = background(h.bgDir);
+  }
+
+  vec3 prev = texture(uPrev, gl_FragCoord.xy / uResolution).rgb;
+  col = mix(prev, col, uBlend);
+  fragColor = vec4(col, 1.0);
+}
